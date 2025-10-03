@@ -15,62 +15,40 @@ from typing import Tuple
 # ----------------------------------------------------------------------
 # 神经网络动力学模型定义 (已修正时间缩放)
 # ----------------------------------------------------------------------
+
 class ODEDynamics(nn.Module):
-    def __init__(self, x_dim, u_dim, hidden_dim=256, dt=0.02):
-        super().__init__()
+    def __init__(self, x_dim, u_dim, hidden_dim=256):
+        super(ODEDynamics, self).__init__()
+        # 神经网络用于逼近 f
         self.net = nn.Sequential(
-            nn.Linear(x_dim + u_dim, hidden_dim), nn.Tanh(),
-            nn.Linear(hidden_dim, hidden_dim), nn.Tanh(),
+            nn.Linear(x_dim + u_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
             nn.Linear(hidden_dim, x_dim),
         )
-        # 训练时t_span=[0,1]，实际dt=0.02。需要将动力学放大 1/dt 倍
-        self.time_scale = 1.0 / dt
 
-    def forward(self, t: float, state_and_control: Tuple[torch.Tensor, torch.Tensor]):
+    def forward(self, t, state_and_control):
         x, u = state_and_control
-        if x.dim() > 1 and u.dim() == 1:
-            u = u.unsqueeze(0).expand(x.shape[0], -1)
-        combined = torch.cat([x, u], dim=-1)
-        # 关键修正：对网络输出进行缩放
-        return self.net(combined) * self.time_scale
+        xu = torch.cat([x, u], dim=1)
+        return self.net(xu)
 
 
-class ODEDynamicsWrapper(nn.Module):
-    def __init__(self, dynamics_func: ODEDynamics, u: torch.Tensor):
-        super().__init__()
-        self.f = dynamics_func
-        self.u = u
 
-    def forward(self, t: float, x: torch.Tensor) -> torch.Tensor:
-        return self.f(t, (x, self.u))
+class NeuralODE(nn.Module):
+    def __init__(self, dynamics_func, solver='dopri5', rtol=1e-5, atol=1e-5):
+        super(NeuralODE, self).__init__()
+        self.dynamics_func = dynamics_func
+        self.solver = solver
+        self.rtol = rtol
+        self.atol = atol
 
-
-class SubstepODEIntStepper(nn.Module):
-    def __init__(self, dynamics: ODEDynamics, default_dt: float, inner_dt: float, method: str = "rk4"):
-        super().__init__()
-        self.f = dynamics
-        self.default_dt = default_dt
-        self.inner_dt = inner_dt
-        self.method = method
-        self.n_sub = int(np.ceil(self.default_dt / self.inner_dt))
-        if self.n_sub == 0:
-            self.n_sub = 1
-
-    def step(self, x: torch.Tensor, u: torch.Tensor, dt: float) -> torch.Tensor:
-        if x.ndim == 1:
-            x = x.unsqueeze(0)
-        if u.ndim == 1:
-            u = u.unsqueeze(0)
-
-        H = self.default_dt
-        if dt != 0.0:
-            H = dt
-
-        t_span = torch.linspace(0.0, H, steps=self.n_sub + 1, device=x.device, dtype=x.dtype)
-        dyn_wrapper = ODEDynamicsWrapper(self.f, u)
-        options = {'step_size': self.inner_dt} if self.method == 'rk4' else None
-        x_traj = odeint(dyn_wrapper, x, t_span, method=self.method, options=options)
-        return x_traj[-1]
+    def forward(self, x0, u, t_span):
+        def wrapped_dynamics(t, x):
+            return self.dynamics_func(t, (x, u))
+        pred_x = odeint(wrapped_dynamics, x0, t_span,
+                        method=self.solver, rtol=self.rtol, atol=self.atol)
+        return pred_x[-1]
 
 # ----------------------------------------------------------------------
 # 辅助函数和物理模型
@@ -89,10 +67,10 @@ def get_future_xref(full_ref_trajectory, k, N, state_dim, output_indices):
     X_ref_future[:, output_indices[0]] = future_refs[:, 0]
     X_ref_future[:, output_indices[1]] = future_refs[:, 1]
     
-    if len(future_refs) > 1:
-        dq_ref = np.diff(future_refs, axis=0, append=future_refs[-1:, :]) / 0.02
-        X_ref_future[:, 5] = dq_ref[:, 0]
-        X_ref_future[:, 6] = dq_ref[:, 1]
+    # if len(future_refs) > 1:
+    #     dq_ref = np.diff(future_refs, axis=0, append=future_refs[-1:, :]) / 0.02
+    #     X_ref_future[:, 5] = dq_ref[:, 0]
+    #     X_ref_future[:, 6] = dq_ref[:, 1]
     
     return X_ref_future
 
@@ -135,7 +113,7 @@ def get_or_create_cmg_model():
 # MPC 控制器定义 (最终修正版 2：修正维度错误)
 # ----------------------------------------------------------------------
 class ODEMPC:
-    def __init__(self, plant_model, model_stepper: SubstepODEIntStepper, 
+    def __init__(self, plant_model, model_stepper, 
                  state_dim, input_dim, N_horizon, Ts, Q, R, 
                  u_min, u_max, scaler_x, scaler_u, optim_iter=10):
         self.plant_model = plant_model
@@ -147,6 +125,7 @@ class ODEMPC:
         self.R = torch.tensor(R, dtype=self.dtype, device=self.device)
         self.u_min = torch.tensor(u_min, dtype=self.dtype, device=self.device)
         self.u_max = torch.tensor(u_max, dtype=self.dtype, device=self.device)
+        self.t_span = torch.tensor([0.0, 1.0]).to(self.device)
 
         # 从scaler对象中提取均值和标准差，并存为张量
         self.x_mean = torch.tensor(scaler_x.mean_, dtype=self.dtype, device=self.device)
@@ -156,7 +135,7 @@ class ODEMPC:
         print("ODEMPC initialized with PyTorch-based scalers for gradient flow.")
 
         self.U = nn.Parameter(torch.zeros(self.N, self.m, dtype=self.dtype, device=self.device))
-        self.optimizer = torch.optim.Adam([self.U], lr=0.05)
+        self.optimizer = torch.optim.Adam([self.U], lr=0.01)
 
     # 用纯张量运算重写缩放函数
     def _scale_x(self, x: torch.Tensor) -> torch.Tensor:
@@ -178,7 +157,7 @@ class ODEMPC:
             u_k = U_seq[k]
             x_current_scaled = self._scale_x(x_current)
             u_k_scaled = self._scale_u(u_k)
-            x_next_scaled = self.model.step(x_current_scaled, u_k_scaled, dt=self.Ts)
+            x_next_scaled = self.model(x_current_scaled, u_k_scaled, self.t_span)
             x_next = self._unscale_x(x_next_scaled)
             
             # 关键修正 1: x_next 已经是 2D [1, 7]，直接 append
@@ -217,17 +196,15 @@ class ODEMPC:
                 
         print(f'Optimal cost: {loss.item():.4f}')
         return self.U.detach().clone()
+    
 
-# ----------------------------------------------------------------------
-# 主程序入口
-# ----------------------------------------------------------------------
 if __name__ == '__main__':
     # --- 基本参数设置 ---
-    Ts = 0.02; 
-    sim_time = 50.0; 
+    Ts = 0.02
+    sim_time = 50.0
     total_steps = int(sim_time / Ts)
-    physics_state_dim = 8; 
-    odenn_state_dim = 7; 
+    physics_state_dim = 8
+    odenn_state_dim = 2
     input_dim = 2
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {DEVICE}")
@@ -242,50 +219,37 @@ if __name__ == '__main__':
 
     # --- 初始化物理和神经网络模型 ---
     cmg_physics_model = get_or_create_cmg_model()
-    
-    # 关键修正：使用修正后的 ODEDynamics 类
-    dynamics_func = ODEDynamics(x_dim=odenn_state_dim, u_dim=input_dim, dt=Ts).to(DEVICE)
-    
-    try:
-        state_dict = torch.load('NeuralODE_best.pth', map_location=DEVICE)
-        new_state_dict = {k.replace('dynamics_func.', ''): v for k, v in state_dict.items()}
-        dynamics_func.load_state_dict(new_state_dict)
-        print("load ODENN model successfully.")
-    except Exception as e: print(f"Failed to load model weights: {e}")
+    dynamics_func = ODEDynamics(x_dim=odenn_state_dim, u_dim=input_dim).to(DEVICE)
+    neural_ode_model = NeuralODE(dynamics_func).to(DEVICE)
+    neural_ode_model.load_state_dict(torch.load("new_ode_model.pth", map_location=DEVICE))
 
-    stepper = SubstepODEIntStepper(dynamics=dynamics_func, default_dt=Ts, inner_dt=0.005, method="rk4")
     
-    # 关键修正：加载训练时使用的 Scaler
     try:
         scaler_x = joblib.load('scaler_x.joblib')
         scaler_u = joblib.load('scaler_u.joblib')
         print("Loaded scalers from training.")
     except FileNotFoundError:
         print("ERROR: scaler_x.joblib or scaler_u.joblib not found.")
-        print("Please run the training script first to generate these files.")
         raise
+    
         
     # --- MPC 控制器参数设置 ---
     physics_to_nn_indices = [2, 3, 1, 4, 5, 6, 7]
     output_indices_in_nn_state = [0, 1]
     
-    N_horizon = 10
-    R_cost = np.diag([10.0, 10.0])
-    Q_cost = np.diag([10.0, 10.0, 0.1, 0.0, 0.1, 1.0, 1.0])
-
+    N_horizon = 20
+    R_cost = np.diag([160.0, 40.0])
+    Q_cost = np.diag([10.0, 10.0])
     u_min_constraint = [-0.5, -0.5]
     u_max_constraint = [0.5, 0.5]
 
-    # --- 实例化带约束和正确Scaler的MPC控制器 ---
     mpc_controller = ODEMPC(
-        plant_model=cmg_physics_model, model_stepper=stepper,
+        plant_model=cmg_physics_model, model_stepper=neural_ode_model,
         state_dim=odenn_state_dim, input_dim=input_dim,
         N_horizon=N_horizon, Ts=Ts, Q=Q_cost, R=R_cost,
-        u_min=u_min_constraint,
-        u_max=u_max_constraint,
-        scaler_x=scaler_x,  # 传入scaler_x
-        scaler_u=scaler_u,  # 传入scaler_u
-        optim_iter=20)
+        u_min=u_min_constraint, u_max=u_max_constraint,
+        scaler_x=scaler_x, scaler_u=scaler_u,
+        optim_iter=10)
     
     # --- 仿真循环 ---
     x0_phys = np.zeros(physics_state_dim)
@@ -293,64 +257,122 @@ if __name__ == '__main__':
     history_u = [np.zeros(mpc_controller.m)]
     f_sim = np.array([0.000187, 0.0118, 0.0027])
 
-    print("\n--- Starting MPC Simulation ---")
+    # --- 1. 修改：开启交互模式并创建图形窗口 ---
+    plt.ion()
+    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
+    fig.tight_layout(pad=3.0)
+    
+    # 准备参考轨迹数据
+    ref_time_axis = np.arange(ref_output_trajectory.shape[0]) * Ts
+    ref_q3_deg = ref_output_trajectory[:, 0] * 180/np.pi
+    ref_q4_deg = ref_output_trajectory[:, 1] * 180/np.pi
+
+    # 初始化绘图元素
+    # 子图1: 角度跟踪
+    axes[0].set_title('MPC Tracking Performance (Live)')
+    axes[0].set_ylabel('Angle [deg]')
+    axes[0].grid(True)
+    line_q3_ref, = axes[0].plot(ref_time_axis, ref_q3_deg, 'k-', label='q3_ref', alpha=0.5)
+    line_q4_ref, = axes[0].plot(ref_time_axis, ref_q4_deg, 'b-', label='q4_ref', alpha=0.5)
+    line_q3_act, = axes[0].plot([], [], 'r--', label='q3_actual')
+    line_q4_act, = axes[0].plot([], [], 'g--', label='q4_actual')
+    axes[0].legend()
+    axes[0].set_xlim(0, sim_time)
+    
+    # 子图2: 控制输入
+    axes[1].set_ylabel('Control Input [Nm]')
+    axes[1].grid(True)
+    axes[1].axhline(y=0.5, color='r', linestyle='--', alpha=0.5)
+    axes[1].axhline(y=-0.5, color='r', linestyle='--', alpha=0.5)
+    line_u1, = axes[1].step([], [], where='post', label='u1 (tau_1)')
+    line_u2, = axes[1].step([], [], where='post', label='u2 (tau_2)')
+    axes[1].legend()
+    axes[1].set_xlim(0, sim_time)
+    axes[1].set_ylim(-0.6, 0.6)
+
+    # 子图3: 角速度
+    axes[2].set_xlabel('Time [s]')
+    axes[2].set_ylabel('Angular Velocities [rad/s]')
+    axes[2].grid(True)
+    line_dq3, = axes[2].plot([], [], label='dq3_actual')
+    line_dq4, = axes[2].plot([], [], label='dq4_actual')
+    axes[2].legend()
+    axes[2].set_xlim(0, sim_time)
+    
+    print("\n--- Starting MPC Simulation with Live Plotting ---")
     start_time = time.time()
-    for k in tqdm(range(total_steps - 1)):
+    
+    # 使用tqdm但禁用默认输出，手动更新
+    progress_bar = tqdm(range(total_steps - 1))
+    
+    for k in progress_bar:
         x_nn_current = x_real_current[physics_to_nn_indices].copy()
+        x_nn_current = x_nn_current[:2]
         X_ref_future_np = get_future_xref(ref_output_trajectory, k, N_horizon, odenn_state_dim, output_indices_in_nn_state)
+        
+        # 求解MPC
         U_optimal_sequence = mpc_controller.solve_ocp(x_nn_current, X_ref_future_np)
         u_apply = U_optimal_sequence[0, :].cpu().numpy()
         
+        # 应用控制并仿真一步
         sol = solve_ivp(
             lambda t, x: cmg_physics_model(t, x, u_apply, f_sim),
-            [0, Ts], x_real_current, method="RK45", rtol=1e-6, atol=1e-8)
+            [0, Ts], x_real_current, method="DOP853", rtol=1e-6, atol=1e-8)
         
         x_real_next = sol.y[:, -1]
-        history_x_phys.append(x_real_next.copy()); history_u.append(u_apply.copy())
+        history_x_phys.append(x_real_next.copy())
+        history_u.append(u_apply.copy())
         x_real_current = x_real_next
         mpc_controller._warm_start()
+        
+        # --- 2. 修改：在循环中更新绘图 (每50步更新一次以提高效率) ---
+        if k % 50 == 0:
+            # 准备当前的数据
+            current_history_x = np.array(history_x_phys)
+            current_history_u = np.array(history_u)
+            current_time_axis = np.arange(current_history_x.shape[0]) * Ts
+            
+            # 更新角度图
+            q3_deg = current_history_x[:, 2] * 180/np.pi
+            q4_deg = current_history_x[:, 3] * 180/np.pi
+            line_q3_act.set_data(current_time_axis, q3_deg)
+            line_q4_act.set_data(current_time_axis, q4_deg)
+            
+            # 更新控制输入图
+            line_u1.set_data(current_time_axis, current_history_u[:, 0])
+            line_u2.set_data(current_time_axis, current_history_u[:, 1])
+
+            # 更新角速度图 (dq3是第7个状态，dq4是第8个)
+            line_dq3.set_data(current_time_axis, current_history_x[:, 6])
+            line_dq4.set_data(current_time_axis, current_history_x[:, 7])
+            
+            # 自动调整Y轴范围
+            for ax in axes:
+                ax.relim()
+                ax.autoscale_view()
+            
+            # 刷新画布
+            fig.canvas.draw()
+            fig.canvas.flush_events()
 
     end_time = time.time()
     print(f"Finish simulation in {end_time - start_time:.2f}s")
 
-    # --- 结果可视化 ---
-    history_x_phys = np.array(history_x_phys); history_u = np.array(history_u)
-    time_axis = np.arange(history_x_phys.shape[0]) * Ts
-    ref_time_axis = np.arange(ref_output_trajectory.shape[0]) * Ts
-
-    q3_deg = history_x_phys[:, 2] * 180/np.pi
-    q4_deg = history_x_phys[:, 3] * 180/np.pi
-    ref_q3_deg = ref_output_trajectory[:, 0] * 180/np.pi
-    ref_q4_deg = ref_output_trajectory[:, 1] * 180/np.pi
+    # --- 3. 修改：仿真结束后保持图形显示 ---
+    plt.ioff()
+    # 最终再画一次，确保显示的是完整数据
+    final_history_x = np.array(history_x_phys)
+    final_history_u = np.array(history_u)
+    final_time_axis = np.arange(final_history_x.shape[0]) * Ts
+    line_q3_act.set_data(final_time_axis, final_history_x[:, 2] * 180/np.pi)
+    line_q4_act.set_data(final_time_axis, final_history_x[:, 3] * 180/np.pi)
+    line_u1.set_data(final_time_axis, final_history_u[:, 0])
+    line_u2.set_data(final_time_axis, final_history_u[:, 1])
+    line_dq3.set_data(final_time_axis, final_history_x[:, 6])
+    line_dq4.set_data(final_time_axis, final_history_x[:, 7])
+    for ax in axes:
+        ax.relim()
+        ax.autoscale_view()
     
-    plt.figure(figsize=(12, 10))
-    
-    # 角度跟踪性能图
-    plt.subplot(3, 1, 1)
-    plt.plot(ref_time_axis, ref_q3_deg, 'k-', label='q3_ref', alpha=0.7)
-    plt.plot(time_axis, q3_deg, 'r--', label='q3_actual')
-    plt.plot(ref_time_axis, ref_q4_deg, 'b-', label='q4_ref', alpha=0.7)
-    plt.plot(time_axis, q4_deg, 'g--', label='q4_actual')
-    plt.legend(); plt.grid(); plt.ylabel('Angle [deg]'); plt.title('MPC Tracking Performance')
-
-    # 控制输入图
-    plt.subplot(3, 1, 2)
-    tu = np.arange(len(history_u)) * Ts
-    if len(history_u) > 0:
-        plt.step(tu, history_u[:,0], label='u1 (tau_1) [Nm]')
-        plt.step(tu, history_u[:,1], label='u2 (tau_2) [Nm]')
-    # 绘制约束线
-    plt.axhline(y=0.5, color='r', linestyle='--', label='Constraint (+0.5 Nm)')
-    plt.axhline(y=-0.5, color='r', linestyle='--', label='Constraint (-0.5 Nm)')
-    plt.legend(); plt.grid(); plt.ylabel('Control Input [Nm]')
-    
-    # 状态图
-    plt.subplot(3, 1, 3)
-    plt.plot(time_axis, history_x_phys[:, 4], label='dq1')
-    plt.plot(time_axis, history_x_phys[:, 5], label='dq2')
-    plt.plot(time_axis, history_x_phys[:, 6], label='dq3')
-    plt.plot(time_axis, history_x_phys[:, 7], label='dq4')
-    plt.legend(); plt.grid(); plt.xlabel('Time [s]'); plt.ylabel('Angular Velocities [rad/s]')
-
-    plt.tight_layout()
+    axes[0].set_title('MPC Tracking Performance (Final Result)')
     plt.show()
