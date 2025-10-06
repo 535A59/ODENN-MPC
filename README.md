@@ -6,3 +6,7 @@
 ## update 03.10.2025
 
 1. the mpc_realtime.py is the latest code, which used the latest parameter and can view the result every 50 steps
+
+## update 06.10.2025
+
+change the optimization iteration from fix time to dymanic stop.
