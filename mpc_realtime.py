@@ -183,7 +183,7 @@ class ODEMPC:
 
             with torch.no_grad():
                 self.U.data.clamp_(self.u_min, self.u_max)
-            if past_loss - loss < 1e-3: break
+            if torch.abs(past_loss - loss) / past_loss < 1e-3: break
             past_loss = loss.item()
                 
         print(f'Optimal cost: {loss.item():.4f}')
