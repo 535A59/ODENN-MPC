@@ -105,11 +105,11 @@ def get_or_create_cmg_model():
 class ODEMPC:
     def __init__(self, plant_model, model_stepper, 
                  state_dim, input_dim, N_horizon, Ts, Q, R, 
-                 u_min, u_max, scaler_x, scaler_u, optim_iter=10):
+                 u_min, u_max, scaler_x, scaler_u):
         self.plant_model = plant_model
         self.model = model_stepper
         self.model.eval()
-        self.n = state_dim; self.m = input_dim; self.N = N_horizon; self.Ts = Ts; self.optim_iter = optim_iter
+        self.n = state_dim; self.m = input_dim; self.N = N_horizon; self.Ts = Ts
         self.device = next(self.model.parameters()).device; self.dtype = next(self.model.parameters()).dtype
         self.Q = torch.tensor(Q, dtype=self.dtype, device=self.device)
         self.R = torch.tensor(R, dtype=self.dtype, device=self.device)
@@ -172,7 +172,9 @@ class ODEMPC:
     def solve_ocp(self, x0_nn, X_ref_future_np):
         x0_tensor = torch.tensor(x0_nn, dtype=self.dtype, device=self.device)
         xref_tensor = torch.tensor(X_ref_future_np, dtype=self.dtype, device=self.device)
-        for _ in range(self.optim_iter):
+        past_loss = torch.tensor(10000000000, dtype=self.dtype, device=self.device)
+        # for _ in range(self.optim_iter):
+        while True:
             self.optimizer.zero_grad()
             X_pred = self._sim_open_loop_model(x0_tensor, self.U)
             loss = self._cost(X_pred, xref_tensor, self.U)
@@ -181,6 +183,8 @@ class ODEMPC:
 
             with torch.no_grad():
                 self.U.data.clamp_(self.u_min, self.u_max)
+            if past_loss - loss < 1e-3: break
+            past_loss = loss.item()
                 
         print(f'Optimal cost: {loss.item():.4f}')
         return self.U.detach().clone()
@@ -208,7 +212,7 @@ if __name__ == '__main__':
     cmg_physics_model = get_or_create_cmg_model()
     dynamics_func = ODEDynamics(x_dim=odenn_state_dim, u_dim=input_dim).to(DEVICE)
     neural_ode_model = NeuralODE(dynamics_func).to(DEVICE)
-    neural_ode_model.load_state_dict(torch.load("NeuralODE_best.pth", map_location=DEVICE))
+    neural_ode_model.load_state_dict(torch.load("NeuralODE_256.pth", map_location=DEVICE))
     neural_ode_model.eval()
 
 
@@ -224,9 +228,9 @@ if __name__ == '__main__':
     physics_to_nn_indices = [2, 3, 1, 4, 5, 6, 7]
     output_indices_in_nn_state = [0, 1]
     
-    N_horizon = 10
-    R_cost = np.diag([40.0, 40.0])
-    Q_cost = np.diag([50.0, 20.0, 0.0, 0.0, 0.0, 1.0, 1.0])
+    N_horizon = 30
+    R_cost = np.diag([1000.0,80.0])
+    Q_cost = np.diag([1000.0,1500.0, 0.0, 0.0, 0.0, 1.0, 1.0])
     u_min_constraint = [-0.5, -0.5]
     u_max_constraint = [0.5, 0.5]
 
@@ -235,8 +239,7 @@ if __name__ == '__main__':
         state_dim=odenn_state_dim, input_dim=input_dim,
         N_horizon=N_horizon, Ts=Ts, Q=Q_cost, R=R_cost,
         u_min=u_min_constraint, u_max=u_max_constraint,
-        scaler_x=scaler_x, scaler_u=scaler_u,
-        optim_iter=20)
+        scaler_x=scaler_x, scaler_u=scaler_u)
     
     x0_phys = np.zeros(physics_state_dim)
     history_x_phys = [x0_phys.copy()]; 
@@ -310,8 +313,7 @@ if __name__ == '__main__':
         x_real_current = x_real_next
         mpc_controller._warm_start()
         
-        # visualization update every 50 steps
-        if k % 50 == 0:
+        if k % 10 == 0:
             current_history_x = np.array(history_x_phys)
             current_history_u = np.array(history_u)
             current_time_axis = np.arange(current_history_x.shape[0]) * Ts
