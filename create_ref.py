@@ -31,9 +31,8 @@ def process_and_truncate_trajectory():
     except ValueError:
         print(f"错误: 无法将数据重塑为 (n, 2) 的形状。请检查数据总长度 {len(ref_vector_stacked.flatten())} 是否为偶数。")
         return
-
-    # --- 3. 提取第 2500 个数据点之后的数据 ---
-    start_index = 2300
+    
+    start_index = 0
     if original_ref_trajectory.shape[0] <= start_index:
         print(f"错误: 起始索引 {start_index} 超出了数据总行数 {original_ref_trajectory.shape[0]}。")
         return

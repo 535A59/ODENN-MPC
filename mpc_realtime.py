@@ -202,7 +202,7 @@ if __name__ == '__main__':
 
     
     try:
-        mat_data = scipy.io.loadmat('Ref.mat')
+        mat_data = scipy.io.loadmat('Ref_Sine-Cosine.mat')
         ref_vector_stacked = mat_data.get('Ref', mat_data.get('X_ref')).flatten()
         output_dim_ref = 2; ref_output_trajectory = ref_vector_stacked.reshape(-1, output_dim_ref)
         print(f"Loaded ref shape: {ref_output_trajectory.shape}")
