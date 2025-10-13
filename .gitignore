@@ -1,0 +1,9 @@
+acados
+l4casadi
+_l4c_generated
+__pycache__
+.DS_Store
+.ipynb_checkpoints
+.vscode
+c_generated_code
+cmg_odenn_mpc.json

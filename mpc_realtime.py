@@ -191,8 +191,8 @@ class ODEMPC:
     
 
 if __name__ == '__main__':
-    Ts = 0.02
-    sim_time = 50.0
+    Ts = 0.01
+    sim_time = 25.0
     total_steps = int(sim_time / Ts)
     physics_state_dim = 8
     odenn_state_dim = 7
@@ -202,11 +202,12 @@ if __name__ == '__main__':
 
     
     try:
-        mat_data = scipy.io.loadmat('Ref_Sine-Cosine.mat')
+        mat_data = scipy.io.loadmat('Ref.mat')
         ref_vector_stacked = mat_data.get('Ref', mat_data.get('X_ref')).flatten()
         output_dim_ref = 2; ref_output_trajectory = ref_vector_stacked.reshape(-1, output_dim_ref)
+        #ref_output_trajectory[:,0] = 0*np.arange(ref_output_trajectory.shape[0])
         print(f"Loaded ref shape: {ref_output_trajectory.shape}")
-    except Exception as e: print(f"load Ref.mat failed: {e}"); raise
+    except Exception as e: print(f"load Ref—Sine-Cosine.mat failed: {e}"); raise
 
     
     cmg_physics_model = get_or_create_cmg_model()
@@ -229,8 +230,8 @@ if __name__ == '__main__':
     output_indices_in_nn_state = [0, 1]
     
     N_horizon = 30
-    R_cost = np.diag([1000.0,80.0])
-    Q_cost = np.diag([1000.0,1500.0, 0.0, 0.0, 0.0, 1.0, 1.0])
+    R_cost = np.diag([1000.0, 800.0])
+    Q_cost = np.diag([200.0,100.0, 0.0, 0.0, 0.0, 10.0, 10.0])
     u_min_constraint = [-0.5, -0.5]
     u_max_constraint = [0.5, 0.5]
 
